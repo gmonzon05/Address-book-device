@@ -28,8 +28,10 @@ STORE_ERROR          = 'STORE_ERROR'
 def storage_init_key():
     """
     Load the database encryption key from disk, or generate and persist a fresh one.
-    Must be called once at startup before any read/write.
+    Idempotent: safe to call if key already loaded in memory.
     """
+    if crypto.crypto_get_key_bytes(DB_KEY_ID) is not None:
+        return   # already loaded
     if os.path.exists(KEY_FILE):
         try:
             with open(KEY_FILE, 'rb') as f:
