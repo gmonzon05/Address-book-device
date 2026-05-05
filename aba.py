@@ -16,6 +16,10 @@ import audit_logger as al
 
 VERSION = "1.0"
 
+# ── Fuzz mode (set by --fuzz flag) ────────────────────────────────────────────
+FUZZ_MODE = False
+_fuzz_seq = 0          # monotonic counter for __FUZZ_START/END__ markers
+
 # ── Startup ───────────────────────────────────────────────────────────────────
 
 def _init():
@@ -91,7 +95,10 @@ def _check_not_admin(cmd: str) -> bool:
 
 def _do_reauth() -> bool:
     """Prompt for password re-entry (SR-6). Returns True on success."""
-    password = getpass.getpass("Re-enter your password to confirm: ")
+    if FUZZ_MODE:
+        password = input("")   # fuzz gen supplies next line
+    else:
+        password = getpass.getpass("Re-enter your password to confirm: ")
     result = auth.auth_verify_password(password)
     if result == auth.AUTH_OK:
         return True
@@ -127,18 +134,27 @@ def cmd_lin(args: list[str]):
         return
     user_id = args[0]
 
-    # Password prompt — hidden input (security: not echoed to terminal)
-    password = getpass.getpass("Password: ")
+    if FUZZ_MODE:
+        # Fuzz: LIN <user> <password> [<newpw> <confirm>]
+        password = args[1] if len(args) > 1 else ''
+    else:
+        password = getpass.getpass("Password: ")
+
     result = auth.auth_login(user_id, password)
 
     if result == auth.AUTH_OK:
         print("OK")
 
     elif result == auth.AUTH_FIRST_LOGIN:
-        # First login or admin-forced password reset
-        print("You must set a new password before continuing.")
-        new_pw  = getpass.getpass("New password: ")
-        confirm = getpass.getpass("Confirm new password: ")
+        if FUZZ_MODE and len(args) >= 4:
+            new_pw  = args[2]
+            confirm = args[3]
+        elif FUZZ_MODE:
+            new_pw = confirm = ''   # will fail complexity → force error path
+        else:
+            print("You must set a new password before continuing.")
+            new_pw  = getpass.getpass("New password: ")
+            confirm = getpass.getpass("Confirm new password: ")
         change  = auth.auth_change_password('', new_pw, confirm, skip_old_check=True)
         if change == auth.AUTH_OK:
             al.audit_log(al.EVT_LOGIN_FIRST, user_id, 'password set')
@@ -168,12 +184,18 @@ def cmd_lou(args: list[str]):
 def cmd_chp(args: list[str]):
     if not _check_auth('CHP'):
         return
-    if len(args) < 1:
-        print("Usage: CHP <old_password>")
-        return
-    old_pw  = args[0]
-    new_pw  = getpass.getpass("New password: ")
-    confirm = getpass.getpass("Confirm new password: ")
+    if FUZZ_MODE:
+        # Fuzz: CHP <old> <new> <confirm>
+        old_pw  = args[0] if len(args) > 0 else ''
+        new_pw  = args[1] if len(args) > 1 else ''
+        confirm = args[2] if len(args) > 2 else ''
+    else:
+        if len(args) < 1:
+            print("Usage: CHP <old_password>")
+            return
+        old_pw  = args[0]
+        new_pw  = getpass.getpass("New password: ")
+        confirm = getpass.getpass("Confirm new password: ")
     result  = auth.auth_change_password(old_pw, new_pw, confirm)
     if result == auth.AUTH_OK:
         print("OK")
@@ -237,7 +259,10 @@ def cmd_rpw(args: list[str]):
     if not _do_reauth():
         return
     target = args[0]
-    new_pw  = getpass.getpass(f"New password for {target}: ")
+    if FUZZ_MODE:
+        new_pw = args[1] if len(args) > 1 else ''
+    else:
+        new_pw  = getpass.getpass(f"New password for {target}: ")
     result  = um.users_reset_password(auth.auth_get_active_user(), target, new_pw)
     if   result == um.USR_OK:               print("OK")
     elif result == um.USR_NOT_FOUND:        print("Account does not exist")
@@ -449,14 +474,33 @@ _DISPATCH = {
 # ── Main loop ─────────────────────────────────────────────────────────────────
 
 def main():
+    global FUZZ_MODE, _fuzz_seq
+    FUZZ_MODE = '--fuzz' in sys.argv
+
     _init()
-    print(f'Address Book Application, version {VERSION}. Type "HLP" for commands.')
+
+    if FUZZ_MODE:
+        # Pre-seed admin password so fuzzer never hits first-login interactively
+        import storage as _st, crypto as _cr
+        _db, _ = _st.storage_read_db()
+        if _db['users']['admin']['password_hash'] is None or _db['users']['admin'].get('force_change'):
+            _h, _ = _cr.crypto_hash_password('FuzzAdmin1!')
+            _db['users']['admin']['password_hash'] = _h
+            _db['users']['admin']['force_change']  = False
+            _st.storage_write_db(_db)
+
+    print(f'Address Book Application, version {VERSION}. Type "HLP" for commands.', flush=True)
 
     while True:
         try:
-            raw = input("ABA> ").strip()
+            if FUZZ_MODE:
+                raw = sys.stdin.readline()
+                if raw == '':          # EOF
+                    break
+                raw = raw.strip()
+            else:
+                raw = input("ABA> ").strip()
         except (EOFError, KeyboardInterrupt):
-            # Graceful exit on Ctrl-D / Ctrl-C
             print()
             if auth.auth_is_authenticated():
                 auth.auth_logout()
@@ -474,11 +518,17 @@ def main():
                 auth.auth_logout()
             break
 
+        if FUZZ_MODE:
+            print(f'__FUZZ_START_{_fuzz_seq}__', flush=True)
+
         if cmd not in _DISPATCH:
             print("Unrecognized command")
-            continue
+        else:
+            _DISPATCH[cmd](args)
 
-        _DISPATCH[cmd](args)
+        if FUZZ_MODE:
+            print(f'__FUZZ_END_{_fuzz_seq}__', flush=True)
+            _fuzz_seq += 1
 
 
 if __name__ == '__main__':
